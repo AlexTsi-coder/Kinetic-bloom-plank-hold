@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="el">
+<head>
+  <meta charset="UTF-8" />
+  <title>AI Plank Hold Coach</title>
+  <style>
+    body { margin:0; background:#000; font-family:sans-serif; overflow:hidden; }
+    #container { position:relative; width:100%; height:100vh; text-align:center; }
+    #webcam, #output { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+    #counter {
+      position:absolute; top:20px; left:50%; transform:translateX(-50%);
+      font-size:3em; font-weight:bold; color:#fff; text-shadow:2px 2px 6px #000; z-index:30;
+    }
+    #startButton {
+      position:absolute; bottom:30px; left:50%; transform:translateX(-50%);
+      padding:12px 24px; font-size:1.1em; font-weight:bold; z-index:40; cursor:pointer;
+    }
+    .feedback-line {
+      position:absolute; left:50%; transform:translateX(-50%);
+      color:#fff; padding:10px 16px; border-radius:10px;
+      font-size:1.35em; font-weight:bold; z-index:35;
+      max-width:92%; white-space:nowrap; text-shadow:1px 1px 4px rgba(0,0,0,0.6);
+      backdrop-filter: blur(4px);
+    }
+    #feedback-action   { bottom:140px; background:rgba(0, 102, 204, 0.88); } /* Μπλε */
+    #feedback-technique{ bottom:90px; } /* Κόκκινο/Πράσινο ορίζεται δυναμικά */
+  </style>
+
+  <!-- TensorFlow + MoveNet -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.21.0"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose"></script>
+</head>
+<body>
+  <div id="container">
+    <video id="webcam" playsinline muted></video>
+    <canvas id="output"></canvas>
+
+    <div id="counter">0s</div>
+    <div id="feedback-action"   class="feedback-line"></div>
+    <div id="feedback-technique"class="feedback-line"></div>
+
+    <button id="startButton">Είμαι έτοιμος!</button>
+  </div>
+
+<script>
+const video = document.getElementById('webcam');
+const canvas = document.getElementById('output');
+const ctx = canvas.getContext('2d');
+
+const counterDiv = document.getElementById('counter');
+const startButton = document.getElementById('startButton');
+const feedbackAction = document.getElementById('feedback-action');
+const feedbackTechnique = document.getElementById('feedback-technique');
+
+let detector, videoReady = false;
+
+// Χρόνος καλής στάσης (accumulated)
+let goodHoldMs = 0;
+let lastTs = null;
+
+// Εξομάλυνση (EMA) keypoints για σταθερότητα
+let smoothKP = null;
+const EMA_ALPHA = 0.35; // 0..1 (μεγαλύτερο = πιο “γρήγορη” απόκριση)
+
+/* ------------ Setup κάμερας & μοντέλου ------------ */
+async function setupWebcam() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user" } });
+    video.srcObject = stream;
+    return new Promise((resolve) => {
+      video.onloadedmetadata = () => {
+        video.setAttribute("playsinline", true);
+        video.muted = true;
+        video.play();
+        videoReady = true;
+        resolve();
+      };
+    });
+  } catch (e) {
+    feedbackAction.textContent = "Δεν είναι δυνατή η πρόσβαση στην κάμερα.";
+    throw e;
+  }
+}
+
+async function loadModel() {
+  feedbackAction.textContent = "Φόρτωση AI...";
+  detector = await poseDetection.createDetector(
+    poseDetection.SupportedModels.MoveNet,
+    { modelType: poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING }
+  );
+  feedbackAction.textContent = 'Έτοιμο! Πάτησε "Είμαι έτοιμος!"';
+}
+
+/* ------------ Helpers ------------ */
+function lerp(a, b, t){ return a + (b - a) * t; }
+
+function emaKeypoints(prev, curr, alpha){
+  if (!prev) return curr.map(p => ({...p}));
+  return curr.map((p, i) => {
+    const q = prev[i] || p;
+    return {
+      ...p,
+      x: lerp(q.x, p.x, alpha),
+      y: lerp(q.y, p.y, alpha),
+      score: p.score
+    };
+  });
+}
+
+function dist(a,b){ return Math.hypot(a.x - b.x, a.y - b.y); }
+
+function getAngle(a, b, c){
+  const abx = a.x - b.x, aby = a.y - b.y;
+  const cbx = c.x - b.x, cby = c.y - b.y;
+  const dot = abx * cbx + aby * cby;
+  const magAB = Math.hypot(abx, aby);
+  const magCB = Math.hypot(cbx, cby);
+  const cos = Math.min(1, Math.max(-1, dot / (magAB * magCB)));
+  return Math.acos(cos) * 180 / Math.PI;
+}
+
+function avg(p1, p2){ return { x:(p1.x+p2.x)/2, y:(p1.y+p2.y)/2 }; }
+
+/* ------------ Έλεγχος τεχνικής PLANK ------------ */
+/* Επιστρέφει { ok, msg } — μία μόνο συμβουλή κάθε φορά. */
+function checkPlankForm(kp){
+  const req = idx => kp[idx] && kp[idx].score > 0.4;
+
+  // Σημεία που χρειαζόμαστε
+  if (!(req(5) && req(6) && req(11) && req(12) && req(9) && req(10) && req(15) && req(16))){
+    return { ok:false, msg:"Μπες ολόκληρος στο κάδρο" };
+  }
+
+  const LShoulder = kp[5],  RShoulder = kp[6];
+  const LHip      = kp[11], RHip      = kp[12];
+  const LWrist    = kp[9],  RWrist    = kp[10];
+  const LAnkle    = kp[15], RAnkle    = kp[16];
+
+  const shoulder = avg(LShoulder, RShoulder);
+  const wrist    = avg(LWrist, RWrist);
+  const hip      = avg(LHip, RHip);
+  const ankle    = avg(LAnkle, RAnkle);
+
+  // Κλίμακα αναφοράς (μήκος κορμού) για thresholds ανεξάρτητα από απόσταση κάμερας
+  const torso = dist(shoulder, hip) || 1;
+
+  // 1) Ώμοι πάνω από καρπούς (κάθετη ευθυγράμμιση => μικρή ΟΡΙΖΟΝΤΙΑ απόκλιση)
+  const shoulderWristHorzOffset = Math.abs(shoulder.x - wrist.x);
+  if (shoulderWristHorzOffset > 0.45 * torso){
+    return { ok:false, msg:"Φέρε τους ώμους πάνω από τους καρπούς" };
+  }
+
+  // 2) ΕΥΘΕΙΑ ΠΛΑΤΗ: γωνίες ώμου–ισχίου–αστραγάλου (και στις 2 πλευρές)
+  const backAngleL = getAngle(LShoulder, LHip, LAnkle);
+  const backAngleR = getAngle(RShoulder, RHip, RAnkle);
+  const backAngle  = (backAngleL + backAngleR) / 2;
+  if (backAngle < 165){ // πιο κάτω από ~165° θεωρείται "σπασμένη" ευθεία
+    return { ok:false, msg:"Ίσιωσε την πλάτη" };
+  }
+
+  // 3) ΛΕΚΑΝΗ: ούτε πολύ ψηλά (pike) ούτε να “πέφτει” (sag)
+  // Χρησιμοποιούμε σχετικές αποστάσεις στον άξονα y (εικόνα: y πιο κάτω = μεγαλύτερο)
+  // Αν η λεκάνη είναι σημαντικά πιο πάνω από τους ώμους → pike
+  if (hip.y + 0.25*torso < shoulder.y){
+    return { ok:false, msg:"Χαμήλωσε τη λεκάνη" };
+  }
+  // Αν η λεκάνη “κρεμάει” χαμηλά σε σχέση με ώμους & αστραγάλους → sag
+  const shoulderToAnkleY = Math.abs(ankle.y - shoulder.y);
+  if (hip.y > shoulder.y + 0.75 * shoulderToAnkleY){
+    return { ok:false, msg:"Μην αφήνεις τη λεκάνη να πέφτει" };
+  }
+
+  return { ok:true, msg:"Τέλεια στάση!" };
+}
+
+/* ------------ Βασικός βρόχος ------------ */
+async function detectLoop(){
+  if (!videoReady || !detector){
+    requestAnimationFrame(detectLoop);
+    return;
+  }
+
+  const poses = await detector.estimatePoses(video, { flipHorizontal: true });
+  const now = performance.now();
+  if (lastTs === null) lastTs = now;
+  const dt = now - lastTs;
+  lastTs = now;
+
+  if (poses.length){
+    // Εξομάλυνση keypoints για σταθερότητα
+    const rawKP = poses[0].keypoints;
+    smoothKP = emaKeypoints(smoothKP, rawKP, EMA_ALPHA);
+
+    // Έλεγχος τεχνικής (μία συμβουλή τη φορά)
+    const { ok, msg } = checkPlankForm(smoothKP);
+
+    // Γραμμή τεχνικής (κόκκινο/πράσινο)
+    feedbackTechnique.textContent = msg;
+    feedbackTechnique.style.backgroundColor = ok
+      ? "rgba(0, 153, 51, 0.88)"   // Πράσινο
+      : "rgba(204, 0, 0, 0.88)";   // Κόκκινο
+
+    // Γραμμή Action + Καταμέτρηση χρόνου καλής στάσης
+    if (ok){
+      feedbackAction.textContent = "Κράτα το plank!";
+      goodHoldMs += dt;
+    } else {
+      feedbackAction.textContent = "Διόρθωσε & μπες σε θέση";
+    }
+
+    counterDiv.textContent = Math.floor(goodHoldMs / 1000) + "s";
+
+    drawPose({ keypoints: smoothKP });
+  }
+
+  requestAnimationFrame(detectLoop);
+}
+
+/* ------------ Σχεδίαση ------------ */
+function drawPose(pose){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+  if (!pose || !pose.keypoints) return;
+  ctx.fillStyle = "yellow";
+  for (const kp of pose.keypoints){
+    if (kp && kp.score > 0.45){
+      ctx.beginPath();
+      ctx.arc(kp.x, kp.y, 5, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+}
+
+/* ------------ Events & Init ------------ */
+startButton.addEventListener('click', () => {
+  startButton.style.display = "none";
+  feedbackAction.textContent = "Ξεκινάμε!";
+  feedbackTechnique.textContent = "";
+  lastTs = null; goodHoldMs = 0;
+  detectLoop();
+});
+
+(async function init(){
+  await setupWebcam();
+  await loadModel();
+})();
+</script>
+</body>
+</html>
