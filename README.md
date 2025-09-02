@@ -1,1 +1,0 @@
-# Kinetic-bloom-plank-hold
